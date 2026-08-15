@@ -1,0 +1,10 @@
+image        /home/dolbeau2/Sun-2_DisKImage/build/eagle.img
+  size       396615680 bytes, 774640 blocks
+  ascii      'Fujitsu-M2351 Eagle cyl 840 alt 2 hd 20 sec 46'
+  magic      0xDABE 
+  checksum   0x4C87 ok
+  geometry   ncyl 840  acyl 2  nhead 20  nsect 46
+  apc 0  gap1 0  gap2 0  intrlv 1  bhead 0  ppart 0
+  a  cyl    0..739     680800 blk    348.6 MB
+  b  cyl  740..839      92000 blk     47.1 MB
+  c  cyl    0..839     772800 blk    395.7 MB

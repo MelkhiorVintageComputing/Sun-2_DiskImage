@@ -1,0 +1,174 @@
+# SunOS 4.0 installed from the full release, then the 4.0.3 upgrade laid over
+# it -- which is what that upgrade set was made for.  PATTERN<TAB>REPLY.
+#
+# Run against a freshly labelled image with the 4.0.3 miniroot already in
+# partition b (tools/putminiroot.py --release 403) and tape 403-1 loaded.  Each
+# step ends by echoing a marker and the next waits for it: the miniroot's shell
+# prints no prompt we can match reliably, and some steps take minutes.
+#
+# Two escapes are available in a reply: ~c hands a command to tmesh, and ~t
+# swaps the tape for another set.  Everything else is typed at the machine.
+#
+# Why the 4.0.3 miniroot and not 4.0's own:
+#
+#   SunOS 4.0's kernel asks the network who it is before it mounts a root, and
+#   will not be talked out of it.  With no Ethernet card fitted it panics --
+#       whoami: in_control 0x16 if_flags 0x49
+#       panic: bad SIOCGIFBRDADDR in_control
+#   (0x49 is UP|LOOPBACK|RUNNING: with only lo0 to ask, it asks lo0) -- and
+#   with a card fitted but nothing behind it, it sits in
+#       revarp: Requesting Internet address for 8:0:20:0:2f:a
+#   for ever.  4.0.3's kernel does neither, booted by exactly the same path;
+#   that was checked by booting a finished 4.0.3 disk through tpboot the same
+#   way, which went straight to "root on sd0a".
+#
+#   So no 4.0 kernel ever runs here: the 4.0.3 miniroot does the installing,
+#   and the kernel the finished disk boots is 4.0.3's.  The 4.0 release is used
+#   for the one thing it is better at -- being complete.
+#
+# Three things about the miniroot shape every command here:
+#
+#  * Its root filesystem is read-only.  mount fails trying to update /etc/mtab
+#    but still mounts; umount fails outright; and the shell cannot write
+#    here-document temporaries.  So files are built with echo and >>, the way
+#    /etc/install/script/create_root does it.
+#
+#  * / and /usr go in ONE filesystem.  See the comment on EAGLE in
+#    tools/sun2disk.py: neither release ships an init in the root, so /usr has
+#    to exist before the first process does.
+#
+#  * Type after the prompt, not before: a program that has just opened
+#    /dev/console flushes what is queued on it.
+#
+# Tape file numbers are 0-based, from each tape's own XDR table of contents.
+# The first six packages are the same in both releases; they diverge after:
+#   4.0    6 root  7 usr  8 Sys  9 Networking  10 Debugging  11 SunView_Users
+#   4.0.3  6 root  7 usr  8 usr/kvm  9 install tools
+
+# --- boot the 4.0.3 miniroot ------------------------------------------------
+# The PROM cannot boot partition b: it reads blocks 1..15 of it, and the
+# miniroot has filesystem there, not a boot block.  tpboot can, because it is a
+# standalone boot with the whole saio filesystem layer behind it.
+#
+# It has to be the 4.0.3 tape's tpboot, and this is not a detail.  The same
+# 4.0.3 miniroot that boots cleanly when 4.0.3's tpboot loads it panics with
+#     whoami: in_control 0x16 if_flags 0x49
+#     panic: bad SIOCGIFBRDADDR in_control
+# when 4.0's tpboot loads it -- same disk, same kernel, same command, only the
+# loader differs.  Whatever 4.0's tpboot leaves in the boot parameters sends
+# the kernel off to ask the network who it is, and with only lo0 to ask (0x49
+# is UP|LOOPBACK|RUNNING) the answer is a panic.  So: boot from this tape, and
+# swap to the 4.0 tape once there is a shell.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	sd(0,0,1)vmunix -s\r
+
+# --- the filesystem ---------------------------------------------------------
+# newfs takes the geometry straight out of our label, and installs a boot block
+# of its own choosing (bootsd, picked from the device name).  The last step
+# here overwrites that with bootxy.
+dump on sd0b fstype spec[\r\n]+# 	/etc/newfs -v /dev/rsd0a; echo M-NEWFS\r
+[\r\n]M-NEWFS	/etc/mount /dev/sd0a /a; echo M-MOUNT\r
+
+# Now the 4.0 tape, for the base system.  tpboot has done its job and is out
+# of the picture; from here the tape is only a tar source.
+[\r\n]M-MOUNT	~t 400-1~;echo M-TAPE400\r
+
+# --- SunOS 4.0, the base ----------------------------------------------------
+# 4.0's Root File System package is a real root: 135 entries, and it already
+# contains ./bin -> usr/bin and ./lib -> usr/lib, which the 4.0.3 upgrade tape
+# has no way of providing.  It has no ./usr, so make that directory here.
+[\r\n]M-TAPE400	cd /a; mt -f /dev/nrst0 asf 6; tar xpbf 20 /dev/nrst0; ls -F /a; echo M-ROOT400\r
+[\r\n]M-ROOT400	mkdir /a/usr; cd /a/usr; mt -f /dev/nrst0 asf 7; tar xpbf 20 /dev/nrst0; echo M-USR400\r
+
+# Sys is /usr/share/sys, the kernel build tree; the other three are ordinary
+# /usr subsets.  Together about 8 MB, which the Eagle has and to spare.
+[\r\n]M-USR400	cd /a/usr; mt -f /dev/nrst0 asf 8; tar xpbf 20 /dev/nrst0; echo M-SYS400\r
+[\r\n]M-SYS400	cd /a/usr; mt -f /dev/nrst0 asf 9; tar xpbf 20 /dev/nrst0; echo M-NET400\r
+[\r\n]M-NET400	cd /a/usr; mt -f /dev/nrst0 asf 10; tar xpbf 20 /dev/nrst0; echo M-DBG400\r
+[\r\n]M-DBG400	cd /a/usr; mt -f /dev/nrst0 asf 11; tar xpbf 20 /dev/nrst0; du -s /a; echo M-SV400\r
+
+# --- SunOS 4.0.3, over the top ----------------------------------------------
+# Swap tapes without stopping the machine.  This is the upgrade: the 4.0.3
+# packages are only what changed, so everything they do not mention stays as
+# 4.0 left it -- which is exactly why the 4.0.3 tapes on their own were not
+# enough to build a system from.
+[\r\n]M-SV400	~t 403-1~;cd /a; mt -f /dev/nrst0 asf 6; tar xpbf 20 /dev/nrst0; echo M-ROOT403\r
+[\r\n]M-ROOT403	cd /a/usr; mt -f /dev/nrst0 asf 7; tar xpbf 20 /dev/nrst0; echo M-USR403\r
+[\r\n]M-USR403	mkdir /a/usr/kvm; cd /a/usr/kvm; mt -f /dev/nrst0 asf 8; tar xpbf 20 /dev/nrst0; echo M-KVM403\r
+
+# 4.0 keeps the kernel, the boot blocks and the standalone programs in
+# /usr/boot, /usr/mdec and /usr/stand; 4.0.3 moves all three under /usr/kvm,
+# which is where the packages just unpacked put them.  What is left behind is a
+# stale 4.0 kernel and a stale 4.0 bootxy, either of which would be picked up
+# by anyone reading the disk later.  Remove them; let /usr/kvm be the only
+# answer.
+#
+# ld.so is the other half of that move.  crt0 opens /usr/lib/ld.so by absolute
+# path, 4.0 shipped a real file there, and 4.0.3 ships its ld.so as
+# /usr/kvm/ld.so and expects the symlink -- which is why its /usr package has
+# no ./lib/ld.so at all.  libc needs no such care: 0.10 and 0.12 sit side by
+# side and ld.so binds a request for either to the highest minor it finds.
+[\r\n]M-KVM403	rm -rf /a/usr/boot /a/usr/mdec /a/usr/stand; rm -f /a/usr/lib/ld.so; ln -s ../kvm/ld.so /a/usr/lib/ld.so; ls -l /a/usr/lib/ld.so; du -s /a; echo M-MERGE\r
+
+# --- the kernel and the secondary boot --------------------------------------
+# GENERIC, not vmunix_small: the small kernel has no xy driver at all, so it
+# cannot be the one that ends up on a Xylogics disk.
+[\r\n]M-MERGE	cp /a/usr/kvm/boot/vmunix /a/vmunix; cp /a/usr/kvm/stand/boot.sun2 /a/boot; ls -l /a/vmunix /a/boot; echo M-KERNEL\r
+
+# --- devices ----------------------------------------------------------------
+# The same argument list suninstall's create_root uses, trimmed to this machine.
+[\r\n]M-KERNEL	PATH=/bin:/etc:/usr/etc:/usr/bin:/usr/ucb; export PATH; cd /a/dev; sh ./MAKEDEV std pty0 xy0 sd0 st0; echo M-DEV\r
+
+# --- /etc/fstab, naming the Xylogics disk -----------------------------------
+[\r\n]M-DEV	rm -f /a/etc/fstab; echo "/dev/xy0a / 4.2 rw 1 1" >> /a/etc/fstab; echo "/dev/xy0b swap swap rw 0 0" >> /a/etc/fstab; cat /a/etc/fstab; echo M-FSTAB\r
+
+# --- a standalone machine, not a YP client ----------------------------------
+# rc.local starts ypbind unconditionally -- every YP action in it is guarded by
+# [ -f /usr/etc/<daemon> ] and nothing else -- and then does
+#     ifconfig ie0 `hostname` netmask +
+# where "netmask +" asks YP for the answer.  With ypbind running and no server
+# to bind to, that call never returns and the boot stops dead after
+#     starting rpc and net services: portmap ypbind keyserv
+# with no login prompt, ever.
+#
+# suninstall's create_root comments the ypbind lines out of rc.local when the
+# machine is not a YP client.  Moving the binary aside does the same thing
+# through the guard the release already wrote, without editing a shipped
+# script, and says plainly what was done.
+[\r\n]M-FSTAB	mv /a/usr/etc/ypbind /a/usr/etc/ypbind.off; sed -e "s/^hostname=unknown/hostname=sun2/" /a/etc/rc.boot > /a/etc/rc.boot.new; mv /a/etc/rc.boot.new /a/etc/rc.boot; chmod 755 /a/etc/rc.boot; grep hostname= /a/etc/rc.boot; echo M-STANDALONE\r
+
+# --- an 8-bit console -------------------------------------------------------
+# getty's default parity handling makes the console 7 bits plus even parity, so
+# the login prompt arrives as
+#     363 365 356 262 240 l o 347 i 356 : 240
+# which is "sun2 login: " with the parity bit set on every character that needs
+# one.  A terminal set to 7E1 would show it correctly and everything else on
+# the wire would be wrong; the FPGA's SCC and every serial program anyone will
+# actually use are 8N1.
+#
+# The capability is p8, not the np that BSD gettytab(5) documents: SunOS's
+# getty has its own table, and the strings in /usr/etc/getty list
+#     ... ep op ap ec co cb ck ce pe rw xc lc uc ig ps hc ub ab dx p8 ...
+# with no np anywhere in it.  np is read as an unknown capability and ignored,
+# which looks exactly like success until the prompt comes out with parity on it
+# again.  The std.9600 entry the console uses has neither.
+#
+# The sed matches the entry name and then edits the line after it (n), because
+# the capability line begins with a tab and a tab is an awkward thing to send
+# down a console.
+[\r\n]M-STANDALONE	sed -e "/std.9600/{n;s/:sp#9600:/:p8:sp#9600:/;}" /a/etc/gettytab > /a/etc/gettytab.new; mv /a/etc/gettytab.new /a/etc/gettytab; chmod 644 /a/etc/gettytab; grep -n "p8:sp#9600" /a/etc/gettytab; echo M-CONSOLE8\r
+
+# --- the boot block ---------------------------------------------------------
+# sync first, and this is not optional: installboot asks the filesystem where
+# /boot's blocks are, and a block that has not reached the disk yet comes back
+# as block 0.  Without the sync the last three of /boot's fifteen blocks are
+# recorded as zero, the secondary boot loads short, its checksum fails, and the
+# machine dies in whatever it jumped into.
+#
+# The proto comes from the target's own /usr/kvm/mdec rather than the
+# miniroot's /usr/mdec, so what lands in blocks 1..15 is the 4.0.3 bootxy that
+# goes with the 4.0.3 kernel it will be loading.
+[\r\n]M-CONSOLE8	cd /; sync; sync; sync; echo M-SYNC\r
+[\r\n]M-SYNC	/usr/mdec/installboot -vl /a/boot /a/usr/kvm/mdec/bootxy /dev/rsd0a; echo M-BOOTBLK\r
+[\r\n]M-BOOTBLK	sync; sync; sync; echo M-INSTALL-COMPLETE\r

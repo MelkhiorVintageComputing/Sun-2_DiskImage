@@ -1,0 +1,4 @@
+# Abort the PROM's auto-boot and boot the distribution tape instead.
+# Lines are PATTERN<TAB>REPLY; the reply's backslash escapes are expanded.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r

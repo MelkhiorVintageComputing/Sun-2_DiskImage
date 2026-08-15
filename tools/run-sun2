@@ -1,0 +1,437 @@
+#! /usr/bin/env python3
+"""Run the Sun 2/120 under tme with its console on this terminal.
+
+tmesh wants stdin for its own command prompt, and the machine wants a serial
+console, so the two cannot share a terminal.  This script gives the machine a
+pty of its own, substitutes that pty into the config, starts tmesh, and then
+sits between you and both of them: what you type goes to the machine, what the
+machine says is printed and logged, and tmesh's own output is prefixed so you
+can tell the emulator talking from the Sun talking.
+
+    tools/run-sun2 --disk eagle.img --tape tape1        interactive
+    tools/run-sun2 --disk eagle.img --script boot.txt   scripted
+    tools/run-sun2 --tmesh 'command tape0 unload'       one-shot tmesh command
+
+Escapes, typed at the start of a line:
+    ~.        quit
+    ~b        send a BREAK (the PROM's L1-A: gets you to the > monitor)
+    ~c CMD    hand CMD to tmesh (e.g. ~c command tape0 unload)
+    ~~        a literal ~
+"""
+
+import argparse
+import os
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOP = os.path.dirname(HERE)
+BUILD = os.path.join(TOP, "build")
+
+TME = os.path.join(BUILD, "tme", "bin", "tmesh")
+LTDL = os.path.join(BUILD, "tme-src")
+ROM = os.path.join(TOP, "Inputs", "sun2-multi-rev-R.bin")
+IDPROM = os.path.join(BUILD, "sun2-idprom.bin")
+TEMPLATE = os.path.join(HERE, "SUN2-MULTIBUS.in")
+
+# The sun2 distribution tapes are raw per-file dumps, and tme's posix-tape
+# takes one host file per tape file, in order.  Both sets here are numbered
+# from 01, but the 4.0.3 dump names its files with a trailing dot and the 4.0
+# dump does not, so the contents of the directory decide rather than a pattern.
+#
+#   4.0    01 tpboot  02 xdrtoc  03 copy  04 miniroot  05 munix  06 munixfs
+#          07 root    08 usr     09 Sys   10 Networking  11 Debugging
+#          12 SunView_Users  13 copyright
+#   4.0.3  01 tpboot  02 xdrtoc  03 copy  04 miniroot  05 munix  06 munixfs
+#          07 root    08 usr     09 usr/kvm  10 install tools  11 copyright
+#
+# Same first six either way; they diverge from the seventh.  Note 4.0 has no
+# install-tools package, because its Root File System package really is one.
+TAPES = {
+    "400-1": "Inputs/sunos400/tape1",
+    "400-2": "Inputs/sunos400/tape2",
+    "403-1": "Inputs/sunos403/tape1",
+    "403-2": "Inputs/sunos403/tape2",
+}
+
+TAPE_FILE = re.compile(r"^(\d+)\.?$")
+
+
+def tape_files(name):
+    """Every numbered file in the tape directory, in tape order."""
+    d = os.path.join(TOP, TAPES[name])
+    if not os.path.isdir(d):
+        sys.exit("%s: no such tape directory" % d)
+    numbered = []
+    for entry in os.listdir(d):
+        m = TAPE_FILE.match(entry)
+        if m:
+            numbered.append((int(m.group(1)), entry))
+    if not numbered:
+        sys.exit("%s: no numbered tape files in it" % d)
+    numbered.sort()
+    return [os.path.join(d, entry) for _, entry in numbered]
+
+
+def session_tag(disks):
+    """A name for this session's files, taken from the disk it is running.
+
+    The config and the control fifo used to be one fixed path each, which is
+    fine until two machines run at once -- one installing the Eagle image and
+    one the small image -- and the second overwrites the first's config while
+    tmesh still has it open.  Naming them after the image keeps concurrent
+    sessions apart without anyone having to remember a flag.
+    """
+    if not disks:
+        return "nodisk"
+    return os.path.splitext(os.path.basename(disks[0]))[0]
+
+
+def build_config(ttya, disks, tape, ram, ether):
+    with open(TEMPLATE) as f:
+        text = f.read()
+
+    disk_lines = []
+    for i, path in enumerate(disks):
+        disk_lines.append(
+            "sd%d at scsibus0: tme/scsi/disk id %d type acb4000" % (i, i))
+        disk_lines.append(
+            "disk%d at sd%d: tme/host/posix/disk file %s" % (i, i, path))
+    if not disk_lines:
+        disk_lines.append("# no disks")
+
+    if tape:
+        tape_line = "command tape0 load " + " ".join(tape_files(tape))
+    else:
+        tape_line = "# no tape loaded"
+
+    # The 3C400 with nothing behind it.  3c400.c calls its ethernet connection
+    # only when there is one (conn_eth ? ... : TME_OK), so the card can be
+    # fitted with no host backend at all -- which is what we want, because the
+    # point is not networking.  SunOS 4.0's kernel asks an interface for its
+    # broadcast address during startup, and with only lo0 to ask it panics:
+    #     whoami: in_control 0x16 if_flags 0x49
+    #     panic: bad SIOCGIFBRDADDR in_control
+    # 0x49 is UP|LOOPBACK|RUNNING.  Giving it a real interface to find gives
+    # the question an answer.
+    ether_line = ("ec0 at mbmem0 addr 0xe0000 ipl 3: tme/bus/multibus/3c400 "
+                  'ether "08:00:20:00:2f:0a"' if ether else "# no Ethernet card")
+
+    text = (text
+            .replace("@IDPROM@", IDPROM)
+            .replace("@ROM@", ROM)
+            .replace("@RAM@", ram)
+            .replace("@TTYA@", ttya)
+            .replace("@DISKS@", "\n".join(disk_lines))
+            .replace("@ETHER@", ether_line)
+            .replace("@TAPE@", tape_line))
+
+    out = os.path.join(BUILD, "SUN2-MULTIBUS-" + session_tag(disks))
+    with open(out, "w") as f:
+        f.write(text)
+    return out
+
+
+def make_pty():
+    master, slave = pty.openpty()
+    name = os.ttyname(slave)
+    # tme opens the slave by name; we keep our own fd on it open so the pty
+    # does not collapse in the gap between tmesh starting and the machine
+    # opening the port.
+    tty.setraw(master)
+    return master, slave, name
+
+
+def strip_ansi(data):
+    return re.sub(rb"\x1b\[[0-9;]*[A-Za-z]", b"", data)
+
+
+def run(args):
+    master, slave_fd, ttya = make_pty()
+    config = build_config(ttya, args.disk, args.tape, args.ram, args.ether)
+    if args.print_config:
+        with open(config) as f:
+            sys.stdout.write(f.read())
+        return 0
+
+    tag = session_tag(args.disk)
+    logpath = args.log or os.path.join(BUILD, "console-%s.log" % tag)
+
+    # A control fifo, so a session can be driven from somewhere other than the
+    # terminal it was started on:  echo 'ls -l /' > build/console.in
+    fifo = args.fifo or os.path.join(BUILD, "console-%s.in" % tag)
+    if os.path.exists(fifo):
+        os.unlink(fifo)
+    os.mkfifo(fifo)
+    # Held open for writing ourselves so it never reaches EOF between writers.
+    fifo_r = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    fifo_w = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+
+    print("+ config  %s" % config)
+    print("+ console %s  (logging to %s)" % (ttya, logpath))
+    print("+ control %s  (echo 'cmd' > %s)" % (fifo, fifo))
+    print("+ escapes: ~. quit   ~b break   ~c <tmesh command>")
+
+    env = dict(os.environ, LTDL_LIBRARY_PATH=LTDL)
+    tmesh = subprocess.Popen([TME, config], env=env,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, bufsize=0)
+    log = open(logpath, "wb", buffering=0)
+
+    for cmd in args.tmesh:
+        tmesh.stdin.write(cmd.encode() + b"\n")
+    tmesh.stdin.flush()
+
+    script = None
+    if args.script:
+        script = Script(args.script)
+
+    stdin_tty = sys.stdin.isatty()
+    saved = termios.tcgetattr(sys.stdin) if stdin_tty else None
+    if stdin_tty:
+        tty.setraw(sys.stdin.fileno())
+
+    def send(reply):
+        """A script reply: one or more actions, separated by ~; and done in order.
+
+        ~c CMD   hand CMD to tmesh
+        ~t NAME  swap the tape for another set.  tme wants the old one
+                 unloaded before a new load, and the file list is long enough
+                 that spelling it out in a script would bury the intent.
+
+        The separator exists because a step waits on a marker in the console
+        output and an escape produces none: without it, swapping the tape and
+        then typing a command would need two steps keyed on the same marker,
+        and the second would wait for a marker that had already been consumed.
+        """
+        if b"~;" in reply:
+            for part in reply.split(b"~;"):
+                send(part)
+            return
+        if reply.startswith(b"~t "):
+            name = reply[3:].strip().decode()
+            tmesh.stdin.write(b"command tape0 unload\n")
+            tmesh.stdin.write(b"command tape0 load "
+                              + " ".join(tape_files(name)).encode() + b"\n")
+            tmesh.stdin.flush()
+        elif reply.startswith(b"~c "):
+            tmesh.stdin.write(reply[3:].strip() + b"\n")
+            tmesh.stdin.flush()
+        else:
+            os.write(master, reply)
+
+    at_line_start = True
+    deadline = time.time() + args.timeout if args.timeout else None
+    stop_on = re.compile(args.stop_on.encode()) if args.stop_on else None
+    seen = bytearray()
+    rc = 0
+    try:
+        while True:
+            if deadline and time.time() > deadline:
+                sys.stdout.write("\r\n+ timeout after %ds%s\r\n"
+                                 % (args.timeout,
+                                    " without matching --stop-on" if stop_on else ""))
+                rc = 2
+                break
+            if tmesh.poll() is not None:
+                sys.stdout.write("\r\n+ tmesh exited (%d)\r\n" % tmesh.returncode)
+                break
+
+            fds = [master, tmesh.stdout, fifo_r]
+            if stdin_tty:
+                fds.append(sys.stdin)
+            ready, _, _ = select.select(fds, [], [], 0.2)
+
+            if fifo_r in ready:
+                data = os.read(fifo_r, 4096)
+                if data:
+                    # ~c and ~b work from the fifo too, one per line.
+                    for line in data.splitlines(True):
+                        if line.strip() == b"~b":
+                            os.write(master, b"^^")
+                        elif line.strip() == b"~.":
+                            raise KeyboardInterrupt
+                        elif line.startswith(b"~c ") or line.startswith(b"~t "):
+                            send(line)
+                        else:
+                            send(line.replace(b"\n", b"\r"))
+
+            if master in ready:
+                data = os.read(master, 4096)
+                log.write(data)
+                if stop_on is not None:
+                    seen += strip_ansi(data)
+                    if stop_on.search(seen):
+                        os.write(sys.stdout.fileno(), data)
+                        os.write(sys.stdout.fileno(),
+                                 b"\r\n+ matched --stop-on\r\n")
+                        rc = 0
+                        break
+                os.write(sys.stdout.fileno(), data)
+                if script:
+                    if script.feed(data, send):
+                        # The script has said everything it had to say; from
+                        # here the session is yours (or the log's).
+                        os.write(sys.stdout.fileno(), b"\r\n+ script done\r\n")
+                        script = None
+                        if args.exit_on_script:
+                            break
+
+            if tmesh.stdout in ready:
+                data = tmesh.stdout.read1(4096)
+                if data:
+                    log.write(b"".join(b"[tmesh] " + l + b"\r\n"
+                                       for l in data.splitlines()))
+                    for line in data.splitlines():
+                        os.write(sys.stdout.fileno(), b"\r\n[tmesh] " + line + b"\r\n")
+
+            if stdin_tty and sys.stdin in ready:
+                data = os.read(sys.stdin.fileno(), 1024)
+                if not data:
+                    break
+                out = bytearray()
+                for byte in data:
+                    ch = bytes([byte])
+                    if at_line_start and ch == b"~":
+                        act = read_escape(master, tmesh)
+                        if act == "quit":
+                            raise KeyboardInterrupt
+                        at_line_start = True
+                        continue
+                    out += ch
+                    at_line_start = ch in (b"\r", b"\n")
+                if out:
+                    os.write(master, bytes(out))
+    except KeyboardInterrupt:
+        rc = 130
+    finally:
+        if stdin_tty:
+            termios.tcsetattr(sys.stdin, termios.TCSAFLUSH, saved)
+        try:
+            tmesh.stdin.write(b"quit\n")
+            tmesh.stdin.flush()
+            tmesh.wait(timeout=3)
+        except Exception:
+            tmesh.kill()
+        log.close()
+        os.close(master)
+        os.close(slave_fd)
+        os.close(fifo_r)
+        os.close(fifo_w)
+        if os.path.exists(fifo):
+            os.unlink(fifo)
+        print("\n+ console log: %s" % logpath)
+    return rc
+
+
+def read_escape(master, tmesh):
+    """One character after a leading ~ at the start of a line."""
+    ch = os.read(sys.stdin.fileno(), 1)
+    if ch == b".":
+        return "quit"
+    if ch == b"~":
+        os.write(master, b"~")
+        return None
+    if ch == b"b":
+        # break-carats: two carats is a BREAK to tme's posix serial.
+        os.write(master, b"^^")
+        return None
+    if ch == b"c":
+        line = b""
+        while not line.endswith(b"\r") and not line.endswith(b"\n"):
+            line += os.read(sys.stdin.fileno(), 1)
+        tmesh.stdin.write(line.strip() + b"\n")
+        tmesh.stdin.flush()
+        return None
+    return None
+
+
+class Script:
+    """expect(1) in thirty lines: lines of 'PATTERN<TAB>REPLY'.
+
+    Every reply waits SETTLE seconds after its pattern matches.  This is not
+    politeness: a program that has just opened /dev/console flushes what is
+    already queued on it, so a reply sent the instant its cue appears in the
+    output can land in the gap and be thrown away.  Matching on a prompt rather
+    than on a message helps, and waiting closes the rest.
+    """
+
+    SETTLE = 1.0
+
+    def __init__(self, path):
+        self.steps = []
+        with open(path) as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#"):
+                    continue
+                pattern, _, reply = line.partition("\t")
+                self.steps.append((re.compile(pattern.encode()),
+                                   reply.encode().decode("unicode_escape").encode()))
+        self.i = 0
+        self.buf = bytearray()
+        self.rc = 0
+
+    def feed(self, data, send):
+        self.buf += strip_ansi(data)
+        while self.i < len(self.steps):
+            pattern, reply = self.steps[self.i]
+            m = pattern.search(self.buf)
+            if not m:
+                return False
+            del self.buf[:m.end()]
+            time.sleep(self.SETTLE)
+            send(reply)
+            self.i += 1
+        return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--disk", action="append", default=[],
+                    help="disk image; repeat for sd0, sd1, ... (paths are "
+                         "relative to build/ if not absolute)")
+    ap.add_argument("--tape", choices=sorted(TAPES),
+                    help="load a distribution tape at power-up")
+    ap.add_argument("--ram", default="4MB", help="main memory (a 2/120 maximum is 4MB)")
+    ap.add_argument("--ether", action="store_true",
+                    help="fit a 3C400 with no host backend; SunOS 4.0 panics "
+                         "at boot without an interface to ask for a broadcast "
+                         "address")
+    ap.add_argument("--script", help="file of PATTERN<TAB>REPLY lines to replay")
+    ap.add_argument("--exit-on-script", action="store_true",
+                    help="stop as soon as the script runs out of steps")
+    ap.add_argument("--tmesh", action="append", default=[],
+                    help="a tmesh command to issue at startup; repeatable")
+    ap.add_argument("--log", help="console log (default build/console.log)")
+    ap.add_argument("--fifo", help="control fifo (default build/console.in)")
+    ap.add_argument("--timeout", type=int, default=0, help="give up after N seconds")
+    ap.add_argument("--stop-on", metavar="REGEX",
+                    help="exit 0 as soon as the console output matches; the "
+                         "timeout then means failure, which makes a boot test "
+                         "a pass/fail")
+    ap.add_argument("--print-config", action="store_true",
+                    help="write the config, print it, and stop")
+    args = ap.parse_args()
+
+    args.disk = [d if os.path.isabs(d) else os.path.join(BUILD, d) for d in args.disk]
+    for d in args.disk:
+        if not os.path.exists(d):
+            sys.exit("%s: no such image (make images first)" % d)
+    if not os.path.exists(IDPROM):
+        sys.exit("%s: no ID PROM (run make idprom)" % IDPROM)
+
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(run(args))
+
+
+if __name__ == "__main__":
+    main()

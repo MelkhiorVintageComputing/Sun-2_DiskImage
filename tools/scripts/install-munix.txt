@@ -1,0 +1,20 @@
+# Boot the 4.0.3 install kernel from tape and give it its ram-disk root.
+#
+# `b st()` loads tape file 0, tpboot, which the PROM can run because it is a
+# raw image.  tpboot then asks for a boot string of its own -- it is the thing
+# that understands a.out -- and the answer is the memory-resident kernel at
+# tape file 4.  Tape files, 0-based, from the tape's own XDR table of contents:
+#
+#   0 tpboot   1 xdrtoc   2 copy   3 miniroot   4 munix   5 munixfs
+#   6 root     7 usr      8 usr/kvm   9 install tools   10 copyright
+#
+# MUNIX has no root of its own; swapgeneric.c asks where to get one.  munixfs
+# is the next file on the tape, so: device st0, tape file number 5.
+#
+# The "Boot: " pattern anchors on the PROM's own "Boot: st(0,0,0)" line so that
+# it cannot match that line's echo instead of tpboot's bare prompt.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	st(0,0,4)\r
+Initialize ram disk from device[^:]*:	st0\r
+Tape file number\?	5\r

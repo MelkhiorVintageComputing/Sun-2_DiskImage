@@ -1,0 +1,14 @@
+# Boot the miniroot that tools/putminiroot.py wrote into partition b.
+#
+# The PROM cannot do this itself: it boots a partition by reading blocks 1..15
+# of it, and the miniroot as shipped has filesystem in those blocks, not a boot
+# block.  tpboot can, because it is a standalone boot with the whole saio
+# filesystem layer behind it -- boot.c calls open() on whatever string you give
+# it, device and path both.  So we load tpboot off the tape and then send it
+# somewhere else entirely.
+#
+# -s is single user.  The kernel takes its root from the device it was booted
+# from, so root ends up on sd0b, which is where the miniroot is.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	sd(0,0,1)vmunix -s\r

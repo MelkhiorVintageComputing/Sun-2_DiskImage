@@ -1,0 +1,17 @@
+# Turn the installed image back into a SCSI disk, so tme can boot it.
+#
+# The finished image is an xy disk: its boot block is bootxy, which carries its
+# own Xylogics driver and goes looking for a controller at 0xEE40 that no
+# emulator has, and its fstab names /dev/xy0a.  Neither can be exercised here.
+# This script swaps both for their sd equivalents; tools/scripts/to-xy.txt
+# swaps them back.  Nothing else about the image changes -- same filesystem,
+# same kernel, same blocks -- so a successful boot after this is a real test of
+# everything except the four bytes of device name.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	sd(0,0,1)vmunix -s\r
+dump on sd0b fstype spec[\r\n]+# 	/etc/mount /dev/sd0a /a; echo M-MOUNT\r
+[\r\n]M-MOUNT	rm -f /a/etc/fstab; echo "/dev/sd0a / 4.2 rw 1 1" >> /a/etc/fstab; echo "/dev/sd0b swap swap rw 0 0" >> /a/etc/fstab; cat /a/etc/fstab; echo M-FSTAB\r
+[\r\n]M-FSTAB	cd /; sync; sync; sync; echo M-SYNC\r
+[\r\n]M-SYNC	/usr/mdec/installboot -vl /a/boot /usr/mdec/bootsd /dev/rsd0a; echo M-BOOTBLK\r
+[\r\n]M-BOOTBLK	sync; sync; sync; echo M-CONVERT-COMPLETE\r

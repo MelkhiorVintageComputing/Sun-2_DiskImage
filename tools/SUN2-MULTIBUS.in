@@ -1,0 +1,55 @@
+# A Sun 2/120 for building SunOS 4.0.3 disk images.
+#
+# Derived from tme-0.8's own machine/sun2/SUN2-MULTIBUS.  Three things differ
+# from the stock file, and each is deliberate:
+#
+#  * No bwtwo, no zs1, no keyboard, no mouse, no GTK display.  The rev-R PROM
+#    sends its console to ttya when it cannot find a video board, which is what
+#    the FPGA does too, and it makes the whole session a pipe we can log and
+#    script.
+#
+#  * The disk is type acb4000, not tme-scsi-1.  The stock file's own comment
+#    says to do this for SunOS.  acb4000.c is only a LUN/INQUIRY/sense shim, so
+#    capacity still comes from the file size and any geometry we label is
+#    accepted.
+#
+#  * The tape drops the "vendor EMULEX product" arguments, again per the stock
+#    comment, to be a 100% Emulex MT-02.
+#
+# Placeholders are substituted by tools/run-sun2.  Do not edit build/SUN2-MULTIBUS;
+# edit this and re-run.
+
+mainbus0: tme/machine/sun2 multibus @IDPROM@
+cpu0 at mainbus0: tme/ic/m68010
+obio0 at mainbus0 obio: tme/generic/bus size 8MB
+obmem0 at mainbus0 obmem: tme/generic/bus size 16MB
+ram0 at obmem0 addr 0x0: tme/host/posix/memory ram @RAM@
+rom0 at obmem0 addr 0xef0000: tme/host/posix/memory rom @ROM@
+rom0 at obmem0 addr 0xef8000
+
+clock0 at obio0 addr 0x2800: tme/machine/sun2/clock
+tod0 at obio0 addr 0x3800: tme/machine/sun2/tod
+zs0 at obio0 addr 0x2000 ipl 6: tme/machine/sun2/zs
+
+mbio0 at mainbus0 mbio: tme/generic/bus size 8MB
+mbmem0: tme/generic/bus size 8MB
+mainbus0 mbmem at mbmem0 addr 0x00000
+
+# The Sun "SCSI-2" Multibus board.  This is the only mass-storage path any
+# version of tme offers a sun2; there is no Xylogics 450 emulation anywhere.
+sc0 at mbmem0 addr 0x80000 ipl 2: tme/bus/multibus/sun-sc
+scsibus0 at sc0: tme/scsi/bus
+
+@ETHER@
+
+# ttya, on the slave side of a pty that tools/run-sun2 made.
+console0 at zs0 channel A: tme/host/posix/serial device @TTYA@ break-carats
+
+@DISKS@
+
+st0 at scsibus0: tme/scsi/tape id 4 type emulex-mt02
+tape0 at st0: tme/host/posix/tape
+
+@TAPE@
+
+command mainbus0 power up

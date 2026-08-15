@@ -1,0 +1,10 @@
+# Turn the image back into a Xylogics disk after a SCSI verification boot.
+# The inverse of tools/scripts/to-sd.txt; see that file for why both exist.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	sd(0,0,1)vmunix -s\r
+dump on sd0b fstype spec[\r\n]+# 	/etc/mount /dev/sd0a /a; echo M-MOUNT\r
+[\r\n]M-MOUNT	rm -f /a/etc/fstab; echo "/dev/xy0a / 4.2 rw 1 1" >> /a/etc/fstab; echo "/dev/xy0b swap swap rw 0 0" >> /a/etc/fstab; cat /a/etc/fstab; echo M-FSTAB\r
+[\r\n]M-FSTAB	cd /; sync; sync; sync; echo M-SYNC\r
+[\r\n]M-SYNC	/usr/mdec/installboot -vl /a/boot /usr/mdec/bootxy /dev/rsd0a; echo M-BOOTBLK\r
+[\r\n]M-BOOTBLK	sync; sync; sync; echo M-CONVERT-COMPLETE\r

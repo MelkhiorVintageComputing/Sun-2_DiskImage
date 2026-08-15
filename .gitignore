@@ -1,0 +1,4 @@
+# Everything reproducible from Inputs/ by the Makefile.
+build/
+*.pyc
+__pycache__/
