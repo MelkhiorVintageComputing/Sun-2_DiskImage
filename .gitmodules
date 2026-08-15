@@ -1,0 +1,6 @@
+[submodule "Inputs/sunos-34-src"]
+	path = Inputs/sunos-34-src
+	url = https://github.com/calmsacibis995/sunos-34-src
+[submodule "Inputs/Run-Sun3-SunOS-4.1.1"]
+	path = Inputs/Run-Sun3-SunOS-4.1.1
+	url = https://github.com/phabrics/Run-Sun3-SunOS-4.1.1
