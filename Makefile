@@ -14,6 +14,7 @@
 #   make install    install SunOS from the tape -- unattended, ~20 minutes
 #   make console    boot the finished image and watch it
 #   make verify     boot a SCSI copy of it under tme, to a login prompt
+#   make netboot    re-extract the three binaries a diskless client runs
 #   make finish     the host-side label and bad-sector-map fixups
 #   make check      everything verifiable without a Sun
 #
@@ -43,7 +44,7 @@ RUN     := $(TOOLS)/run-sun2
 
 .PHONY: all tme idprom images miniroot install install-small installed-ok \
         verify finish \
-        check clean distclean \
+        netboot check clean distclean \
         profiles console rescue
 
 all: images
@@ -158,6 +159,24 @@ installed-ok:
 	fi
 	@$(LABEL) bootblk $(BUILD)/$(IMG).img --want xy
 	@echo "$(IMG): installed"
+
+## ----------------------------------------------------------------- netboot
+
+# The three programs a diskless Sun-2 runs, in the order it runs them.  They
+# are committed in netboot/ because the machine that serves them is not this
+# one; this target re-extracts them from the tape and checks they came out the
+# same.  netboot/README.md is the client's side of the story.
+NETBOOT := $(TOP)/netboot
+KVM403  := $(INPUTS)/sunos403/tape1/09.
+
+netboot:
+	mkdir -p $(NETBOOT)
+	tar xOf $(KVM403) stand/sun2.bb    > $(NETBOOT)/sun2.bb
+	tar xOf $(KVM403) stand/boot.sun2  > $(NETBOOT)/boot.sun2
+	tar xOf $(KVM403) boot/vmunix      > $(NETBOOT)/vmunix
+	chmod 755 $(NETBOOT)/sun2.bb $(NETBOOT)/boot.sun2 $(NETBOOT)/vmunix
+	@cd $(NETBOOT) && sha256sum -c --quiet SHA256SUMS \
+	  && echo "netboot: three binaries, hashes match the tape"
 
 ## ------------------------------------------------------------------ verify
 

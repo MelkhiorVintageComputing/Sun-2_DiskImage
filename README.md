@@ -186,6 +186,7 @@ root, so `/usr` has to exist before the first process does.
 | `tools/scripts/*.txt` | the answers, as `PATTERN<TAB>REPLY` |
 | `tools/selftest.py` | the label and bad-sector checks that need no Sun |
 | `doc/INSTALL.md` | why each answer is what it is |
+| `netboot/` | the three binaries a *diskless* Sun-2 runs, and what it does with them |
 
 ## Installing on the target
 
