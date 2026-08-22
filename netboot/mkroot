@@ -1,0 +1,150 @@
+#! /usr/bin/env python3
+"""Unpack the netbootable SunOS 4.0.3 root and make it this client's.
+
+    sudo netboot/mkroot --hostname sun2 --ip 192.168.0.123 /export/sun2
+
+That directory is then the client's NFS root, exported read-write to it.  It
+holds /usr as well, so the client mounts nothing else -- see netboot/README.md
+for why, and for what the server still has to provide: rarpd, ndbootd, tftpd
+with sun2.bb and <HEXIP>.SUN2, bootparamd, and NFS.
+
+Root is required.  The archive carries ~600 device nodes and every file is
+owned by root; unpacked as anyone else, /dev comes out empty and the modes are
+wrong, and nothing says so until the client fails to boot.
+"""
+
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tarfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ARCHIVE = os.path.join(HERE, "root-4.0.3.tar.gz")
+
+
+def hexip(ip):
+    """The name a Sun-2 asks TFTP for: its address in uppercase hex."""
+    parts = [int(p) for p in ip.split(".")]
+    if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+        raise ValueError("not an IPv4 address: %s" % ip)
+    return "%02X%02X%02X%02X" % tuple(parts)
+
+
+def patch(path, rewrite, dry_run, archive=None, member=None):
+    """Rewrite one file through a function, reporting what changed.
+
+    A dry run has nothing unpacked to look at, so it reads the file out of the
+    archive instead and shows the change it would make.  Saying "not present"
+    when the answer is "it will be, and here is what would happen to it" is the
+    kind of dry run that teaches nobody anything.
+    """
+    if os.path.exists(path):
+        with open(path, "r", errors="surrogateescape") as f:
+            before = f.read()
+    elif dry_run and archive and member:
+        with tarfile.open(archive) as tf:
+            try:
+                before = tf.extractfile(member).read().decode("ascii", "surrogateescape")
+            except KeyError:
+                print("  %s: not in the archive" % member)
+                return
+    else:
+        print("  %s: not present, skipped" % path)
+        return
+    after = rewrite(before)
+    if after == before:
+        print("  %s: already correct" % path)
+        return
+    if dry_run:
+        print("  %s: would change" % path)
+        for b, a in zip(before.splitlines(), after.splitlines()):
+            if a != b:
+                print("      - %s\n      + %s" % (b, a))
+        return
+    with open(path, "w", errors="surrogateescape") as f:
+        f.write(after)
+    print("  %s: patched" % path)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("dest", help="where the client's root goes")
+    ap.add_argument("--hostname", default="sun2", help="the client's name")
+    ap.add_argument("--ip", required=True, help="the client's IPv4 address")
+    ap.add_argument("--server", help="SERVER:/PATH for the fstab root line; "
+                                     "defaults to the destination on this host")
+    ap.add_argument("--archive", default=ARCHIVE)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="say what would happen and touch nothing")
+    args = ap.parse_args()
+
+    try:
+        hx = hexip(args.ip)
+    except ValueError as e:
+        sys.exit(str(e))
+
+    if not os.path.exists(args.archive):
+        sys.exit("%s: not found" % args.archive)
+
+    if not args.dry_run and os.geteuid() != 0:
+        sys.exit("must be root: the archive has ~600 device nodes and "
+                 "root-owned files, and unpacking as anyone else produces a "
+                 "root that cannot boot.  Re-run with sudo, or use --dry-run.")
+
+    print("client   %s at %s (asks TFTP for %s.SUN2)" % (args.hostname, args.ip, hx))
+    print("root     %s" % args.dest)
+
+    # --- unpack ---
+    if args.dry_run:
+        with tarfile.open(args.archive) as tf:
+            members = tf.getmembers()
+        devs = sum(1 for m in members if m.ischr() or m.isblk())
+        print("would unpack %d members (%d device nodes) into %s"
+              % (len(members), devs, args.dest))
+    else:
+        os.makedirs(args.dest, exist_ok=True)
+        # GNU tar rather than Python's: it restores device nodes, hard links,
+        # setuid bits and mtimes in one pass and is what the manual page on any
+        # server describes.
+        subprocess.run(["tar", "xpf", args.archive, "-C", args.dest],
+                       check=True)
+        print("unpacked")
+
+    # --- make it this machine's ---
+    print("patching:")
+    d = args.dest
+
+    # rc.boot ships with hostname=unknown and sets the name from it.
+    patch(os.path.join(d, "etc/rc.boot"),
+          lambda t: re.sub(r"(?m)^hostname=.*$", "hostname=" + args.hostname, t),
+          args.dry_run, args.archive, "./etc/rc.boot")
+
+    # /etc/hosts wants the client itself; the loopback line is already there.
+    def add_host(text):
+        if re.search(r"(?m)^\s*%s\s+" % re.escape(args.ip), text):
+            return text
+        return text.rstrip("\n") + "\n%s\t%s\n" % (args.ip, args.hostname)
+    patch(os.path.join(d, "etc/hosts"), add_host,
+          args.dry_run, args.archive, "./etc/hosts")
+
+    # The disk build leaves an fstab naming /dev/xy0a.  A netbooted client has
+    # its root already mounted by the kernel, from bootparams; the line is here
+    # because create_root writes one, and because mount -a should not fail.
+    server = args.server or "%s:%s" % (os.uname().nodename, os.path.abspath(d))
+    patch(os.path.join(d, "etc/fstab"),
+          lambda t: "%s / nfs rw 0 0\n" % server,
+          args.dry_run, args.archive, "./etc/fstab")
+
+    print("\nStill yours to do on the server:")
+    print("  ethers/hosts     %s for the ND and RARP lookups" % args.hostname)
+    print("  bootparams       %s root=THIS_HOST:%s" % (args.hostname, os.path.abspath(d)))
+    print("  exports          %s, read-write, to %s" % (os.path.abspath(d), args.hostname))
+    print("  tftpboot         sun2.bb, and %s.SUN2 as a copy of boot.sun2" % hx)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

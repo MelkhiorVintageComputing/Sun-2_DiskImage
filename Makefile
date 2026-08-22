@@ -15,6 +15,7 @@
 #   make console    boot the finished image and watch it
 #   make verify     boot a SCSI copy of it under tme, to a login prompt
 #   make netboot    re-extract the three binaries a diskless client runs
+#   make netboot-root  capture the installed tree as a netbootable tar
 #   make finish     the host-side label and bad-sector-map fixups
 #   make check      everything verifiable without a Sun
 #
@@ -44,7 +45,7 @@ RUN     := $(TOOLS)/run-sun2
 
 .PHONY: all tme idprom images miniroot install install-small installed-ok \
         verify finish \
-        netboot check clean distclean \
+        netboot netboot-root check clean distclean \
         profiles console rescue
 
 all: images
@@ -178,6 +179,38 @@ netboot:
 	@cd $(NETBOOT) && sha256sum -c --quiet SHA256SUMS \
 	  && echo "netboot: three binaries, hashes match the tape"
 
+## ------------------------------------------------- the netbootable root
+
+# A diskless client's root, as a tar the server can unpack -- see
+# netboot/README.md.  Three steps, only the first of which needs a Sun:
+#
+#   capture   the installed tree, tarred onto a blank second disk by SunOS's
+#             own tar, plus an ls -l of /dev written into the tree first
+#   assemble  the host reads that archive back out and re-emits it with the
+#             device nodes synthesised, because SunOS tar cannot carry them
+#   deploy    netboot/mkroot, on the server, which is the only part anyone
+#             else runs
+#
+# The blank disk carries the eagle label: /dev/rsd1c cannot be opened without
+# one, and partition c is 395 MB against a ~30 MB archive.
+CAPTURE   := $(BUILD)/capture.img
+ROOTTAR   := $(NETBOOT)/root-4.0.3.tar.gz
+DEVTABLE  := $(NETBOOT)/dev.table
+
+$(CAPTURE):
+	mkdir -p $(BUILD)
+	$(PYTHON) -c "import sys; sys.path.insert(0,'$(TOOLS)'); \
+	  from sun2disk import EAGLE; open('$@','wb').truncate(EAGLE.image_bytes)"
+	$(LABEL) write $@ --profile eagle
+
+netboot-root: $(TMESH) $(IDPROM) $(EAGLE) $(CAPTURE)
+	$(RUN) --disk eagle.img --disk capture.img --tape 403-1 \
+	       --script $(TOOLS)/scripts/capture-root.txt \
+	       --stop-on '[\r\n]M-CAPTURE-COMPLETE' --timeout 3500 \
+	       --log $(BUILD)/capture.log
+	$(PYTHON) $(TOOLS)/mkroottar.py $(CAPTURE) --out $(ROOTTAR) \
+	       --dev-table $(DEVTABLE)
+
 ## ------------------------------------------------------------------ verify
 
 # The finished image cannot be booted here: its boot block is bootxy, which
@@ -228,6 +261,8 @@ finish:
 
 check:
 	$(PYTHON) $(TOOLS)/selftest.py
+	@test -f $(ROOTTAR) && $(PYTHON) $(TOOLS)/mkroottar.py --verify $(ROOTTAR) \
+	    --dev-table $(DEVTABLE) || echo "(no netboot root built yet)"
 	@for img in $(EAGLE) $(SMALL); do \
 	  test -f $$img || continue; \
 	  prof=eagle; case $$img in *small*) prof=small;; esac; \

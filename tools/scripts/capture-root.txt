@@ -1,0 +1,56 @@
+# Capture the installed tree as a tar, for netbooting.
+#
+# Run against build/eagle.img (already installed) with a second, labelled blank
+# disk and tape 403-1 loaded.  The archive lands raw on that disk's partition c,
+# starting at its first block, and tools/mkroottar.py reads it back off the host
+# side.
+#
+# The capture disk is sd2, not sd1.  Sun's sc driver numbers slaves as
+# target * 8 + LUN, so the second disk -- SCSI id 1, LUN 0 -- comes out as
+# slave 8 and unit 2, while sd1 is target 0's LUN 1 and is not there at all:
+#
+#     sd0 at sc0 slave 0
+#     sd0:  <Fujitsu-M2351 Eagle cyl 840 alt 2 hd 20 sec 46>
+#     sd1 at sc0 slave 1
+#     sd2 at sc0 slave 8
+#     sd2:  <Fujitsu-M2351 Eagle cyl 840 alt 2 hd 20 sec 46>
+#
+# Written to rsd1c the tar goes nowhere and says nothing: the label is still on
+# the capture disk afterwards and the archive is simply absent.
+#
+# Two things about SunOS tar decide the shape of this:
+#
+#   * It cannot archive device nodes.  Inputs/sunos-34-src/bin/tar.c switches on
+#     S_IFMT and handles S_IFDIR, S_IFLNK and regular files; everything else
+#     falls to "tar: %s is not a file. Not dumped".  So /dev's ~600 nodes are
+#     silently absent from anything tar writes, and the table below is how they
+#     come back: ls -l names them with their major and minor, and mkroottar.py
+#     turns that into real CHRTYPE/BLKTYPE members.
+#
+#   * Its errors go to the console, one line per node, at 9600 baud.  They are
+#     redirected to a file and counted instead, which turns a minute of scrolling
+#     into a number worth checking: it should match the node count in dev.table.
+#
+# The miniroot is booted exactly as tools/scripts/boot-miniroot.txt does; see
+# that file and doc/INSTALL.md for why it has to be the 4.0.3 tape's tpboot.
+Auto-boot in progress	\r
+[\r\n]>	b st()\r
+st\(0,0,0\)[^\n]*\n+Boot: 	sd(0,0,1)vmunix -s\r
+
+# The tree to capture.  The mtab error is expected -- the miniroot's own root is
+# read-only -- and the mount happens anyway.
+dump on sd0b fstype spec[\r\n]+# 	/etc/mount /dev/sd0a /a; ls -F /a; echo M-MOUNT\r
+
+# The device table, written into the tree so it rides out inside the archive
+# rather than having to come back up a serial line.
+[\r\n]M-MOUNT	ls -l /a/dev > /a/dev.table; grep -c . /a/dev.table; echo M-DEVTABLE\r
+
+# The tree itself.  Blocking factor 20 is what every other tar in this build
+# uses; sd2c is the whole of the capture disk.  The exit status is echoed
+# because tar's own complaints are going to a file.
+[\r\n]M-DEVTABLE	cd /a; tar cbf 20 /dev/rsd2c . 2> /a/tar.errors; echo tar-status $?; echo M-TAR\r
+
+# What tar refused, counted rather than read.  "not a file" should account for
+# every line: anything else in here is a real failure.
+[\r\n]M-TAR	grep -c 'not a file' /a/tar.errors; grep -v 'not a file' /a/tar.errors; echo M-ERRORS\r
+[\r\n]M-ERRORS	cd /; sync; sync; sync; echo M-CAPTURE-COMPLETE\r

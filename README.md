@@ -20,6 +20,8 @@ make install    # 4.0 then the 4.0.3 upgrade; unattended, about half an hour
 make verify     # boot a SCSI copy of the result, to a login prompt
 make finish     # the host-side label and bad-sector-map fixups
 make check      # everything checkable without a Sun
+
+make netboot-root   # capture the installed tree as a netbootable root tar
 ```
 
 `Inputs/` is immutable, the same rule as in `Sun-2_FPGA`. `../Sun-2_FPGA`
@@ -186,7 +188,7 @@ root, so `/usr` has to exist before the first process does.
 | `tools/scripts/*.txt` | the answers, as `PATTERN<TAB>REPLY` |
 | `tools/selftest.py` | the label and bad-sector checks that need no Sun |
 | `doc/INSTALL.md` | why each answer is what it is |
-| `netboot/` | the three binaries a *diskless* Sun-2 runs, and what it does with them |
+| `netboot/` | what a *diskless* Sun-2 runs: the three binaries, and the root as a tar |
 
 ## Installing on the target
 

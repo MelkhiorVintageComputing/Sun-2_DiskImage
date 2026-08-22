@@ -12,6 +12,9 @@ all.
 | 3 | `boot.sun2` | **TFTP**, as `<HEXIP>.SUN2` | 120,936 |
 | 4 | `vmunix` | **NFS**, from the client's root | 822,486 |
 
+The root those last two need is here too, as `root-4.0.3.tar.gz` — see
+[The root](#the-root).
+
 All three are SunOS 4.0.3 for sun2, taken from tape 1 file 8 of
 `Inputs/sunos403/` (`/usr/kvm/stand/sun2.bb`, `/usr/kvm/stand/boot.sun2`,
 `/usr/kvm/boot/vmunix`). `make -C .. netboot` re-extracts them; the checksums
@@ -188,6 +191,78 @@ boot.sun2 ─RARP, then bootparams whoami + getfile ──▶  rpc.bootparamd
 Four network protocols, three of them standard, and each program throws away
 what the one before it learned.
 
+## The root
+
+`vmunix` has to come out of somewhere, and step 4 mounts that somewhere over
+NFS. **`root-4.0.3.tar.gz`** is it: the same complete SunOS 4.0.3 the disk build
+produces — 4.0 with the 4.0.3 upgrade over it — as an archive the server
+unpacks.
+
+```sh
+sudo ./mkroot --hostname sun2 --ip 192.168.0.123 /export/sun2
+```
+
+That directory is then the client's NFS root, exported read-write to it. Root
+and `/usr` are in **one tree**, so the client mounts nothing else: the kernel
+asks bootparams for `root`, `swap` and `dump` and never for `usr`, and with one
+export there is nothing for `/etc/rc` to get wrong on first boot. `/sbin` also
+carries `init`, `sh`, `mount`, `ifconfig` and `hostname`, which is the set
+`setup_client` copies out of `/usr/kvm/boot` for a diskless client and the
+reason the kernel can find an `init` before anything is mounted.
+
+`mkroot` patches only what is this machine's — `etc/rc.boot`'s `hostname=`,
+`etc/hosts`, and `etc/fstab`, which arrives from the disk build naming
+`/dev/xy0a` and leaves naming the NFS root. `--dry-run` reads the files out of
+the archive and shows the changes without unpacking anything. It refuses to run
+as anyone but root, because `tar` cannot make device nodes otherwise:
+
+```
+tar: ./dev/des: Cannot mknod: Operation not permitted
+```
+
+and a root unpacked that way has an empty `/dev` and no way to say so.
+
+### Why the archive exists at all
+
+Git carries no device nodes, and this tree has 113 of them. It also has 147
+symlinks and 29 setuid binaries. A tar keeps all three; a checked-in directory
+would keep none.
+
+Building it is a two-step job because **SunOS's own `tar` cannot archive device
+nodes either**. `Inputs/sunos-34-src/bin/tar.c` switches on `S_IFMT`, handles
+`S_IFDIR`, `S_IFLNK` and regular files, and sends everything else to
+
+```c
+default: fprintf(stderr, "tar: %s is not a file. Not dumped\n", longname);
+```
+
+So `make netboot-root` writes `ls -l /dev` into the tree first, tars the tree
+onto a blank second disk from inside the emulator, and then reassembles both
+halves on the host — `tools/mkroottar.py` copies the members through and turns
+the table back into real `CHRTYPE`/`BLKTYPE` entries. The two numbers agree,
+which is the check worth having: SunOS `tar` refused 113 files, and the table
+describes 113 nodes.
+
+`dev.table` is committed beside the archive in plain text, so the device
+numbers stay readable and diffable rather than living only inside a blob.
+`make check` verifies the archive against it without needing root.
+
+The capture disk is **sd2**, not sd1: Sun's `sc` driver numbers slaves as
+target × 8 + LUN, so a second disk at SCSI id 1 comes out as slave 8 and unit
+2, while `sd1` is target 0's LUN 1 and is not there at all. Written to
+`rsd1c` the tar goes nowhere and says nothing.
+
+### What the server still owes it
+
+Not this script's business, but the client will want them: `ethers` and `hosts`
+entries for the ND and RARP lookups, a `bootparams` entry giving `root`, an
+export, and `/tftpboot` holding `sun2.bb` and a copy of `boot.sun2` named
+`<HEXIP>.SUN2`. `mkroot` prints the list with the values filled in.
+
+One thing worth deciding early: the kernel asks bootparams for **`swap`** as
+well as `root`. With no swap entry the client runs swapless, which on a 4 MB
+machine is tight.
+
 ## Where these go on the server
 
 The names are the server's business, not the client's, but for reference:
@@ -196,7 +271,7 @@ The names are the server's business, not the client's, but for reference:
 |---|---|
 | `sun2.bb` | `/tftpboot/sun2.bb` — what `ndbootd` serves |
 | `boot.sun2` | `/tftpboot/<HEXIP>.SUN2`, a copy or symlink per client |
-| `vmunix` | the client's NFS root, as `/vmunix` |
+| `vmunix` | the client's NFS root, as `/vmunix` — already inside `root-4.0.3.tar.gz` |
 
 ## Provenance
 
